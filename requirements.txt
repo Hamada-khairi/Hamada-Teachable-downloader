@@ -1,0 +1,6 @@
+selenium>=4.11.2
+requests>=2.31.0
+yt-dlp
+seleniumbase>=4.20.8
+pycryptodomex
+beautifulsoup4>=4.12.0
