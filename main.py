@@ -45,7 +45,7 @@ def truncate_title_to_fit_file_name(title, max_file_name_length=250):
 
 class TeachableDownloader:
     def __init__(self, verbose_arg=False, complete_lecture_arg=False, user_agent_arg=None, timeout_arg=10, output_dir_arg=None):
-        self.driver = Driver(uc=True, headed=True)
+        self.driver = Driver(uc=True, headed=True, page_load_strategy="eager")
         self.headers = {
             "User-Agent": user_agent_arg,
             "Origin": "https://player.hotmart.com",
@@ -113,26 +113,31 @@ class TeachableDownloader:
             logging.info("No need to bypass cloudflare")
             return
 
-    def _do_login(self, start_url, email, password, login_url, man_login_url):
-        if man_login_url is None:
-            if login_url:
-                self.driver.get(login_url)
-            else:
-                try:
-                    self.find_login(start_url)
-                except Exception as e:
-                    logging.error(f"Could not find login: {e}", exc_info=self.verbose)
-            try:
-                self.login(email, password)
-            except Exception as e:
-                logging.error(f"Could not login: {e}", exc_info=self.verbose)
-                return False
-        else:
+    def _do_login(self, start_url, email, password, login_url, man_login_url, max_retries=3):
+        if man_login_url is not None:
             self.driver.get(start_url)
             while self.driver.current_url != man_login_url:
                 time.sleep(3)
                 logging.info(f"Waiting for manual navigation to: {man_login_url}")
-        return True
+            return True
+
+        for attempt in range(1, max_retries + 1):
+            try:
+                if login_url:
+                    self.driver.get(login_url)
+                else:
+                    self.find_login(start_url)
+                self.login(email, password)
+                return True
+            except Exception as e:
+                logging.warning(f"Login attempt {attempt}/{max_retries} failed: {e}")
+                if attempt < max_retries:
+                    wait = 5 * attempt
+                    logging.info(f"Retrying login in {wait}s...")
+                    time.sleep(wait)
+                else:
+                    logging.error(f"All {max_retries} login attempts failed. Giving up.")
+                    return False
 
     def run(self, course_url, email, password, login_url, man_login_url):
         logging.info("Starting login")
@@ -263,11 +268,11 @@ class TeachableDownloader:
             logging.debug("Filling in login form")
             email_element.click()
             email_element.clear()
-            self.driver.execute_script(f"document.getElementById('email').value={{json.dumps(email)}}")
+            self.driver.execute_script("document.getElementById('email').value=" + json.dumps(email))
 
             password_element.click()
             password_element.clear()
-            self.driver.execute_script(f"document.getElementById('password').value={{json.dumps(password)}}")
+            self.driver.execute_script("document.getElementById('password').value=" + json.dumps(password))
 
             commit_element.click()
             
@@ -562,14 +567,10 @@ class TeachableDownloader:
             chapter_title = "{:02d}-{}".format(chapter_idx, chapter_title)
             logging.info("Found chapter: " + chapter_title)
 
-            try:
-                not_available_element = WebDriverWait(slim_section, self.global_timeout).until(
-                    EC.presence_of_element_located((By.CSS_SELECTOR, ".drip-tag")))
+            drip_tags = slim_section.find_elements(By.CSS_SELECTOR, ".drip-tag")
+            if drip_tags:
                 logging.warning('Chapter "%s" not available, skipping', chapter_title)
                 continue
-            except TimeoutException:
-                logging.info("Chapter is available")
-                pass  # Element wasn't found so the chapter is available
 
             download_path = os.path.join(course_path, chapter_title)
             os.makedirs(download_path, exist_ok=True)
@@ -604,20 +605,24 @@ class TeachableDownloader:
             if self.driver.current_url != video["link"]:
                 logging.info("Navigating to lecture: " + video["title"])
                 self.driver.get(video["link"])
-                self.driver.implicitly_wait(self.global_timeout)
             logging.info("Processing lecture: " + video["title"])
 
-            try:
-                logging.info("Saving html")
-                self.save_webpage_as_html(video["title"], video["idx"], video["download_path"])
-            except Exception as e:
-                logging.error("Could not save html: " + video["title"] + " cause: " + str(e), exc_info=self.verbose)
+            # Skip HTML/attachments if already saved from a previous run
+            html_file = os.path.join(video["download_path"], "{:02d}-{}.html".format(video["idx"], video["title"]))
+            if os.path.isfile(html_file):
+                logging.info(f"HTML already exists, skipping save: {video['title']}")
+            else:
+                try:
+                    logging.info("Saving html")
+                    self.save_webpage_as_html(video["title"], video["idx"], video["download_path"])
+                except Exception as e:
+                    logging.error("Could not save html: " + video["title"] + " cause: " + str(e), exc_info=self.verbose)
 
-            try:
-                logging.info("Downloading attachments")
-                self.download_attachments(video["link"], video["title"], video["idx"], video["download_path"])
-            except Exception as e:
-                logging.warning("Could not download attachments: " + video["title"] + " cause: " + str(e))
+                try:
+                    logging.info("Downloading attachments")
+                    self.download_attachments(video["link"], video["title"], video["idx"], video["download_path"])
+                except Exception as e:
+                    logging.warning("Could not download attachments: " + video["title"] + " cause: " + str(e))
             
             try:
                 logging.debug("Trying to download video as an attachment")
@@ -629,19 +634,24 @@ class TeachableDownloader:
             except Exception as e:
                 logging.debug("Could not download video as an attachment: " + video["title"] + " cause: " + str(e))
 
+            # ── Strategy 1: Hotmart embed-player iframes with __NEXT_DATA__ ──
+            video_found = False
             video_iframes = self.driver.find_elements(By.XPATH, "//iframe[starts-with(@data-testid, 'embed-player')]")
 
             for i, iframe in enumerate(video_iframes):
                 try:
-                    logging.info("Switching to video frame")
+                    logging.info("Switching to video frame (Hotmart)")
                     self.driver.switch_to.frame(iframe)
 
+                    # Wait briefly for __NEXT_DATA__ to appear
+                    WebDriverWait(self.driver, 3).until(
+                        EC.presence_of_element_located((By.ID, "__NEXT_DATA__")))
                     script_text = self.driver.find_element(By.ID, "__NEXT_DATA__")
                     json_text = json.loads(script_text.get_attribute("innerHTML"))
                     link = json_text["props"]["pageProps"]["applicationData"]["mediaAssets"][0]["urlEncrypted"]
 
-                    # Append -n to the video title if there are multiple iframes
                     video_title = video["title"] + ("-" + str(i + 1) if len(video_iframes) > 1 else "")
+                    logging.info(f"Found Hotmart video URL for: {video_title}")
 
                     download_tasks.append({
                         "yt_link": link,
@@ -650,13 +660,65 @@ class TeachableDownloader:
                         "download_path": video["download_path"],
                         "original_lecture_link": video["link"]
                     })
-
+                    video_found = True
                     self.driver.switch_to.default_content()
 
                 except Exception as e:
                     self.driver.switch_to.default_content()
-                    logging.warning("Could not find video: " + video["title"])
+                    logging.debug(f"Hotmart iframe extraction failed for {video['title']}: {e}")
                     continue
+
+            # ── Strategy 2: Wistia / generic iframes ──
+            if not video_found:
+                all_iframes = self.driver.find_elements(By.TAG_NAME, "iframe")
+                for i, iframe in enumerate(all_iframes):
+                    src = iframe.get_attribute("src") or ""
+                    logging.debug(f"Found iframe src: {src}")
+                    if any(host in src for host in ["wistia", "vimeo", "youtube", "fast.wistia"]):
+                        video_title = video["title"] + ("-" + str(i + 1) if len(all_iframes) > 1 else "")
+                        logging.info(f"Found embedded video URL ({src[:60]}...) for: {video_title}")
+                        download_tasks.append({
+                            "yt_link": src,
+                            "video_title": video_title,
+                            "video_idx": video["idx"],
+                            "download_path": video["download_path"],
+                            "original_lecture_link": video["link"]
+                        })
+                        video_found = True
+
+            # ── Strategy 3: Direct video/source tags on the page ──
+            if not video_found:
+                video_tags = self.driver.find_elements(By.TAG_NAME, "video")
+                for vtag in video_tags:
+                    src = vtag.get_attribute("src")
+                    if not src:
+                        source_tags = vtag.find_elements(By.TAG_NAME, "source")
+                        for stag in source_tags:
+                            src = stag.get_attribute("src")
+                            if src:
+                                break
+                    if src:
+                        logging.info(f"Found direct <video> source for: {video['title']}")
+                        download_tasks.append({
+                            "yt_link": src,
+                            "video_title": video["title"],
+                            "video_idx": video["idx"],
+                            "download_path": video["download_path"],
+                            "original_lecture_link": video["link"]
+                        })
+                        video_found = True
+                        break
+
+            # ── Strategy 4: Fallback — let yt-dlp try the lecture page URL directly ──
+            if not video_found:
+                logging.info(f"No embedded video found, trying yt-dlp on lecture URL: {video['link']}")
+                download_tasks.append({
+                    "yt_link": video["link"],
+                    "video_title": video["title"],
+                    "video_idx": video["idx"],
+                    "download_path": video["download_path"],
+                    "original_lecture_link": video["link"]
+                })
 
             if self._complete_lecture:
                 try:
@@ -665,13 +727,14 @@ class TeachableDownloader:
                 except Exception as e:
                     logging.warning("Could not complete lecture: " + video["title"] + " cause: " + str(e))
             
-            if not video_iframes:
+            if not video_found and not video_iframes:
                 completed_links.add(video["link"])
                 self._save_progress(course_path, completed_links)
 
         # Phase 2: Parallel downloads
         if download_tasks:
             logging.info(f"Starting Phase 2: Parallel download of {len(download_tasks)} videos...")
+            failed_tasks = []
             with ThreadPoolExecutor(max_workers=6) as executor:
                 futures = {
                     executor.submit(
@@ -691,6 +754,22 @@ class TeachableDownloader:
                         self._save_progress(course_path, completed_links)
                     except Exception as e:
                         logging.error(f"Download failed for {task['video_title']}: {e}")
+                        failed_tasks.append(task)
+
+            # Retry failed downloads sequentially with native downloader
+            if failed_tasks:
+                logging.info(f"Retrying {len(failed_tasks)} failed downloads with native downloader...")
+                for task in failed_tasks:
+                    try:
+                        self.download_video(
+                            task["yt_link"], task["video_title"],
+                            task["video_idx"], task["download_path"],
+                            use_native=True
+                        )
+                        completed_links.add(task["original_lecture_link"])
+                        self._save_progress(course_path, completed_links)
+                    except Exception as e:
+                        logging.error(f"Retry also failed for {task['video_title']}: {e}")
 
     def complete_lecture(self):
         # Complete lecture
@@ -702,12 +781,20 @@ class TeachableDownloader:
             logging.info("Completed lecture")
             time.sleep(3)
 
-    def download_video(self, link, title, video_index, output_path):
+    def download_video(self, link, title, video_index, output_path, use_native=False, max_retries=3):
         out_file = os.path.join(output_path, "{:02d}-{}.mp4".format(video_index, title))
         if os.path.isfile(out_file):
             logging.info(f"Skipping already downloaded: {title}")
             return
-            
+
+        # Clean up partial downloads from previous attempts
+        part_file = out_file + ".part"
+        if os.path.isfile(part_file):
+            try:
+                os.remove(part_file)
+            except OSError:
+                pass
+
         ydl_opts = {
             "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
             "merge_output_format": "mp4",
@@ -717,28 +804,71 @@ class TeachableDownloader:
                 },
             ],
             "http_headers": self.headers,
-            "concurrent_fragment_downloads": 5,
-            "external_downloader": "ffmpeg",
-            "external_downloader_args": {
-                "ffmpeg_i": [
-                    "-protocol_whitelist", "file,http,https,tcp,tls,crypto,m3u8",
-                    "-thread_queue_size", "512",
-                    "-reconnect", "1",
-                    "-reconnect_streamed", "1",
-                ]
-            },
-            "hls_prefer_native": False,
-            "hls_use_mpegts": True,
-            "writesubtitles": True,
-            "subtitleslangs": ["en", "en-US", "en-GB"],
             "outtmpl": out_file,
             "verbose": self.verbose,
+            "retries": 10,
+            "fragment_retries": 10,
+            "file_access_retries": 5,
+            "extractor_retries": 5,
+            "socket_timeout": 30,
+            "noprogress": not self.verbose,
         }
-        try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                ydl.download([link])
-        except Exception as e:
-            logging.error("Could not download video: " + title + " cause: " + str(e))
+
+        if not use_native:
+            # Fast path: ffmpeg external downloader for HLS
+            ydl_opts.update({
+                "concurrent_fragment_downloads": 5,
+                "external_downloader": {"m3u8": "ffmpeg"},
+                "external_downloader_args": {
+                    "ffmpeg_i": [
+                        "-protocol_whitelist", "file,http,https,tcp,tls,crypto,m3u8",
+                        "-thread_queue_size", "512",
+                        "-reconnect", "1",
+                        "-reconnect_streamed", "1",
+                    ]
+                },
+                "hls_prefer_native": False,
+                "hls_use_mpegts": True,
+            })
+        else:
+            # Fallback: native downloader (slower but more compatible)
+            logging.info(f"Using native downloader for: {title}")
+            ydl_opts.update({
+                "concurrent_fragment_downloads": 10,
+                "hls_prefer_native": True,
+            })
+
+        last_error = None
+        for attempt in range(1, max_retries + 1):
+            try:
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    ydl.download([link])
+                logging.info(f"Successfully downloaded: {title}")
+                return  # Success
+            except Exception as e:
+                last_error = e
+                logging.warning(f"Download attempt {attempt}/{max_retries} failed for {title}: {e}")
+                if attempt < max_retries:
+                    wait = 3 * attempt
+                    logging.info(f"Retrying in {wait}s...")
+                    time.sleep(wait)
+                    # Clean up partial file before retry
+                    if os.path.isfile(part_file):
+                        try:
+                            os.remove(part_file)
+                        except OSError:
+                            pass
+
+        # If ffmpeg path failed all retries, try native as last resort
+        if not use_native and last_error:
+            logging.info(f"ffmpeg failed {max_retries}x for {title}, falling back to native downloader...")
+            try:
+                self.download_video(link, title, video_index, output_path, use_native=True, max_retries=2)
+                return
+            except Exception as e:
+                logging.error(f"Native fallback also failed for {title}: {e}")
+
+        raise Exception(f"All download attempts exhausted for {title}: {last_error}")
                 
     def download_video_file(self, title, video_index, output_path, timeout=300):
         video_title = "{:02d}-{}".format(video_index, title)
